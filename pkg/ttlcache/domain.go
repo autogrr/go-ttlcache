@@ -57,13 +57,13 @@ func (cm *cacheMap[K, V]) load(key K) (Item[V], bool) {
 // expiry.  The keyspace is split across shards, each protected by its own
 // RWMutex, so concurrent operations on different keys never contend.
 type Cache[K comparable, V any] struct {
-	tc          *timecache.Cache // pointer — must not be copied after first use
-	shards      []cacheMap[K, V] // len is always a power of 2
-	perShardMin []atomic.Int64   // per-shard earliest scheduled deadline (UnixNano; 0 = none)
-	seed        maphash.Seed     // stable per-instance hash seed
-	o           Options[K, V]
-	ch          chan shardWakeup
-	closed      atomic.Bool // set by Close(); guards notify()
+	tc     *timecache.Cache // pointer — must not be copied after first use
+	shards []cacheMap[K, V] // len is always a power of 2
+	seed   maphash.Seed     // stable per-instance hash seed
+	o      Options[K, V]
+	ch     chan shardWakeup
+	done   chan struct{} // closed by Close(); signals expiry goroutine to stop
+	closed atomic.Bool   // set by Close(); fast-path guard for notify()
 }
 
 // shard returns the cacheMap responsible for key using a bitmask.

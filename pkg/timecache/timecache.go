@@ -64,12 +64,10 @@ func (c *Cache) update() time.Time {
 	// Sleep for half the period so callers see a clock that advances at the
 	// configured resolution.  When using the default 1 s period, we wake at
 	// 500 ms — still well within the 1 s resolution guarantee.
-	sleep := d / 2
-
-	go func() {
+	go func(c *Cache, sleep time.Duration) {
 		time.Sleep(sleep)
 		c.t.Store(nil)
-	}()
+	}(c, d/2)
 
 	return t
 }

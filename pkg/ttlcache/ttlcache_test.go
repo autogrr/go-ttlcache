@@ -32,15 +32,22 @@ func TestGet(t *testing.T) {
 
 func TestExpirations(t *testing.T) {
 	t.Parallel()
-	c := New[int, bool](Options[int, bool]{}.SetDefaultTTL(200 * time.Millisecond))
+	const n = 10
+	var evicted atomic.Int32
+	done := make(chan struct{})
+	o := Options[int, bool]{}.SetDefaultTTL(200 * time.Millisecond).
+		SetDeallocationFunc(func(_ int, _ bool, reason DeallocationReason) {
+			if reason == ReasonTimedOut && evicted.Add(1) == n {
+				close(done)
+			}
+		})
+	c := New[int, bool](o)
 	defer c.Close()
-	for i := 0; i < 10; i++ {
+	for i := 0; i < n; i++ {
 		c.Set(i, true, DefaultTTL)
 	}
-
-	time.Sleep(1 * time.Second)
-
-	for i := 0; i < 10; i++ {
+	<-done
+	for i := 0; i < n; i++ {
 		if _, ok := c.Get(i); ok {
 			t.Fatalf("found key: %d", i)
 		}
@@ -49,20 +56,27 @@ func TestExpirations(t *testing.T) {
 
 func TestSwaps(t *testing.T) {
 	t.Parallel()
-	c := New[int, bool](Options[int, bool]{}.SetDefaultTTL(200 * time.Millisecond))
+	const n = 10
+	var evicted atomic.Int32
+	wave1 := make(chan struct{})
+	o := Options[int, bool]{}.SetDefaultTTL(200 * time.Millisecond).
+		SetDeallocationFunc(func(_ int, _ bool, reason DeallocationReason) {
+			if reason == ReasonTimedOut && evicted.Add(1) == n {
+				close(wave1)
+			}
+		})
+	c := New[int, bool](o)
 	defer c.Close()
-	for i := 0; i < 10; i++ {
+	for i := 0; i < n; i++ {
 		c.Set(i, true, DefaultTTL)
 	}
-
-	time.Sleep(1 * time.Second)
-	for i := 0; i < 10; i++ {
+	<-wave1
+	for i := 0; i < n; i++ {
 		if _, ok := c.Get(i); ok {
 			t.Fatalf("found key: %d", i)
 		}
 	}
-
-	for i := 10; i < 20; i++ {
+	for i := n; i < n*2; i++ {
 		c.Set(i, true, DefaultTTL)
 		if _, ok := c.Get(i); !ok {
 			t.Fatalf("missing key: %d", i)
@@ -72,14 +86,22 @@ func TestSwaps(t *testing.T) {
 
 func TestRetimer(t *testing.T) {
 	t.Parallel()
-	c := New[int, bool](Options[int, bool]{}.SetDefaultTTL(200 * time.Millisecond))
+	const n = 9 // keys 1..9
+	var evicted atomic.Int32
+	done := make(chan struct{})
+	o := Options[int, bool]{}.SetDefaultTTL(200 * time.Millisecond).
+		SetDeallocationFunc(func(_ int, _ bool, reason DeallocationReason) {
+			if reason == ReasonTimedOut && evicted.Add(1) == n {
+				close(done)
+			}
+		})
+	c := New[int, bool](o)
 	defer c.Close()
-	for i := 1; i < 10; i++ {
-		c.Set(i, true, time.Duration(10-i)*100*time.Millisecond)
+	for i := 1; i <= n; i++ {
+		c.Set(i, true, time.Duration(10-i)*50*time.Millisecond)
 	}
-
-	time.Sleep(2 * time.Second)
-	for i := 1; i < 10; i++ {
+	<-done
+	for i := 1; i <= n; i++ {
 		if _, ok := c.Get(i); ok {
 			t.Fatalf("found key: %d", i)
 		}
@@ -88,14 +110,22 @@ func TestRetimer(t *testing.T) {
 
 func TestSchedule(t *testing.T) {
 	t.Parallel()
-	c := New[int, bool](Options[int, bool]{}.SetDefaultTTL(1 * time.Second))
+	const n = 9 // keys 1..9
+	var evicted atomic.Int32
+	done := make(chan struct{})
+	o := Options[int, bool]{}.SetDefaultTTL(500 * time.Millisecond).
+		SetDeallocationFunc(func(_ int, _ bool, reason DeallocationReason) {
+			if reason == ReasonTimedOut && evicted.Add(1) == n {
+				close(done)
+			}
+		})
+	c := New[int, bool](o)
 	defer c.Close()
-	for i := 1; i < 10; i++ {
-		c.Set(i, true, time.Duration(i)*100*time.Millisecond)
+	for i := 1; i <= n; i++ {
+		c.Set(i, true, time.Duration(i)*50*time.Millisecond)
 	}
-
-	time.Sleep(3 * time.Second)
-	for i := 1; i < 10; i++ {
+	<-done
+	for i := 1; i <= n; i++ {
 		if _, ok := c.Get(i); ok {
 			t.Fatalf("found key: %d", i)
 		}
@@ -104,7 +134,18 @@ func TestSchedule(t *testing.T) {
 
 func TestInterlace(t *testing.T) {
 	t.Parallel()
-	c := New[int, bool](Options[int, bool]{}.SetDefaultTTL(100 * time.Millisecond))
+	// 10 keys: odd indices get NoTTL, even indices get DefaultTTL (100ms).
+	// 5 keys will expire (even: 0,2,4,6,8); 5 are NoTTL (odd: 1,3,5,7,9).
+	const mortal = 5
+	var evicted atomic.Int32
+	done := make(chan struct{})
+	o := Options[int, bool]{}.SetDefaultTTL(100 * time.Millisecond).
+		SetDeallocationFunc(func(_ int, _ bool, reason DeallocationReason) {
+			if reason == ReasonTimedOut && evicted.Add(1) == mortal {
+				close(done)
+			}
+		})
+	c := New[int, bool](o)
 	defer c.Close()
 	swap := false
 	for i := 0; i < 10; i++ {
@@ -115,15 +156,13 @@ func TestInterlace(t *testing.T) {
 		}
 		c.Set(i, true, ttl)
 	}
-
-	time.Sleep(1 * time.Second)
+	<-done
 	swap = false
 	for i := 0; i < 10; i++ {
 		swap = !swap
 		if !swap {
 			continue
 		}
-
 		if _, ok := c.Get(i); !ok {
 			t.Fatalf("found key: %d", i)
 		}
@@ -132,15 +171,23 @@ func TestInterlace(t *testing.T) {
 
 func TestReschedule(t *testing.T) {
 	t.Parallel()
-	c := New[int, bool](Options[int, bool]{}.SetDefaultTTL(100 * time.Millisecond))
+	const n = 9 // keys 1..9
+	var evicted atomic.Int32
+	done := make(chan struct{})
+	o := Options[int, bool]{}.SetDefaultTTL(100 * time.Millisecond).
+		SetDeallocationFunc(func(_ int, _ bool, reason DeallocationReason) {
+			if reason == ReasonTimedOut && evicted.Add(1) == n {
+				close(done)
+			}
+		})
+	c := New[int, bool](o)
 	defer c.Close()
-	for i := 1; i < 10; i++ {
+	for i := 1; i <= n; i++ {
 		c.Set(i, true, NoTTL)
 		c.Set(i, true, DefaultTTL)
 	}
-
-	time.Sleep(1 * time.Second)
-	for i := 1; i < 10; i++ {
+	<-done
+	for i := 1; i <= n; i++ {
 		if _, ok := c.Get(i); ok {
 			t.Fatalf("found key: %d", i)
 		}
@@ -149,17 +196,30 @@ func TestReschedule(t *testing.T) {
 
 func TestRescheduleNoTTL(t *testing.T) {
 	t.Parallel()
-	c := New[int, bool](Options[int, bool]{}.SetDefaultTTL(100 * time.Millisecond))
+	// Items are first set with DefaultTTL then immediately overwritten with NoTTL.
+	// The deallocation func must never fire, because no item has an active TTL.
+	// We confirm they're still present after an expiry cycle has had time to run.
+	const n = 9 // keys 1..9
+	var evicted atomic.Int32
+	o := Options[int, bool]{}.SetDefaultTTL(100 * time.Millisecond).
+		SetDeallocationFunc(func(_ int, _ bool, _ DeallocationReason) {
+			evicted.Add(1)
+		})
+	c := New[int, bool](o)
 	defer c.Close()
-	for i := 1; i < 10; i++ {
+	for i := 1; i <= n; i++ {
 		c.Set(i, true, DefaultTTL)
 		c.Set(i, true, NoTTL)
 	}
-
-	time.Sleep(1 * time.Second)
-	for i := 1; i < 10; i++ {
+	// Give the expiry goroutine a full cycle to (incorrectly) fire — if it does,
+	// evicted will be non-zero.
+	time.Sleep(250 * time.Millisecond)
+	if evicted.Load() != 0 {
+		t.Fatalf("NoTTL items were evicted unexpectedly")
+	}
+	for i := 1; i <= n; i++ {
 		if _, ok := c.Get(i); !ok {
-			t.Fatalf("found key: %d", i)
+			t.Fatalf("missing key: %d", i)
 		}
 	}
 }
@@ -182,24 +242,18 @@ func TestDelete(t *testing.T) {
 
 func TestDeallocationTimeout(t *testing.T) {
 	t.Parallel()
-	var hit atomic.Bool
+	done := make(chan struct{})
 	o := Options[int, bool]{}.
 		SetDefaultTTL(time.Millisecond * 100).
 		SetDeallocationFunc(func(key int, value bool, reason DeallocationReason) {
 			if reason == ReasonTimedOut {
-				hit.Store(true)
+				close(done)
 			}
 		})
-
 	c := New[int, bool](o)
 	defer c.Close()
-
 	c.Set(0, true, DefaultTTL)
-
-	time.Sleep(3 * time.Second)
-	if !hit.Load() {
-		t.Fatalf("Deallocation not hit.")
-	}
+	<-done
 }
 
 func TestDeallocationDeleted(t *testing.T) {
@@ -276,7 +330,7 @@ func TestNoTTLNeverExpires(t *testing.T) {
 	defer c.Close()
 
 	c.Set(1, "forever", NoTTL)
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 
 	v, ok := c.Get(1)
 	if !ok || v != "forever" {

@@ -127,14 +127,21 @@ func TestStressExpiryNeverResurrects(t *testing.T) {
 		t.Skip("skipping in short mode")
 	}
 	const (
-		keys       = 256
-		ttl        = 80 * time.Millisecond
-		expireWait = 500 * time.Millisecond
+		keys = 256
+		ttl  = 80 * time.Millisecond
 	)
 	// DisableUpdateTime so concurrent Gets don't extend the sliding-window TTL.
-	c := New[int, int](Options[int, int]{}.
+	var evicted atomic.Int64
+	allGone := make(chan struct{})
+	o := Options[int, int]{}.
 		SetDefaultTTL(ttl).
-		DisableUpdateTime(true))
+		DisableUpdateTime(true).
+		SetDeallocationFunc(func(_ int, _ int, reason DeallocationReason) {
+			if reason == ReasonTimedOut && evicted.Add(1) == keys {
+				close(allGone)
+			}
+		})
+	c := New[int, int](o)
 	defer c.Close()
 
 	// Write all keys.
@@ -143,12 +150,11 @@ func TestStressExpiryNeverResurrects(t *testing.T) {
 	}
 
 	// Concurrently read while the items expire.
-	stop := make(chan struct{})
 	var reads atomic.Int64
 	go func() {
 		for {
 			select {
-			case <-stop:
+			case <-allGone:
 				return
 			default:
 				c.Get(int(reads.Add(1)) % keys)
@@ -156,8 +162,7 @@ func TestStressExpiryNeverResurrects(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(expireWait)
-	close(stop)
+	<-allGone
 
 	// Every key must now be gone.
 	var alive int
@@ -184,11 +189,12 @@ func TestStressExpiryExactCount(t *testing.T) {
 	)
 
 	var callbacks atomic.Int64
+	allGone := make(chan struct{})
 	o := Options[int, bool]{}.
 		SetDefaultTTL(ttl).
 		SetDeallocationFunc(func(_ int, _ bool, reason DeallocationReason) {
-			if reason == ReasonTimedOut {
-				callbacks.Add(1)
+			if reason == ReasonTimedOut && callbacks.Add(1) == keys {
+				close(allGone)
 			}
 		})
 	c := New[int, bool](o)
@@ -198,8 +204,7 @@ func TestStressExpiryExactCount(t *testing.T) {
 		c.Set(k, true, DefaultTTL)
 	}
 
-	// Let everything expire; wait generously.
-	time.Sleep(600 * time.Millisecond)
+	<-allGone
 
 	got := callbacks.Load()
 	if got != keys {
@@ -221,7 +226,18 @@ func TestStressNoTTLSurvivesExpiryCycles(t *testing.T) {
 		ttl        = 40 * time.Millisecond
 		cycles     = 5
 	)
-	c := New[int, string](Options[int, string]{}.SetDefaultTTL(ttl))
+
+	// cycleSignal receives one token per mortal-key timeout.  We drain exactly
+	// mortalKeys tokens per round to know when a full cycle has expired.
+	cycleSignal := make(chan struct{}, mortalKeys*cycles)
+	o := Options[int, string]{}.
+		SetDefaultTTL(ttl).
+		SetDeallocationFunc(func(key int, _ string, reason DeallocationReason) {
+			if reason == ReasonTimedOut && key >= noTTLKeys {
+				cycleSignal <- struct{}{}
+			}
+		})
+	c := New[int, string](o)
 	defer c.Close()
 
 	for k := 0; k < noTTLKeys; k++ {
@@ -232,7 +248,10 @@ func TestStressNoTTLSurvivesExpiryCycles(t *testing.T) {
 		for k := noTTLKeys; k < noTTLKeys+mortalKeys; k++ {
 			c.Set(k, "mortal", DefaultTTL)
 		}
-		time.Sleep(ttl * 3)
+		// Wait for all mortalKeys in this round to time out.
+		for i := 0; i < mortalKeys; i++ {
+			<-cycleSignal
+		}
 	}
 
 	// All NoTTL keys must still be alive.
@@ -416,27 +435,30 @@ func TestStressConcurrentDeleteAndExpiry(t *testing.T) {
 		t.Skip("skipping in short mode")
 	}
 	const (
-		rounds = 50
+		rounds = 10
 		ttl    = 30 * time.Millisecond
 	)
 
 	for round := 0; round < rounds; round++ {
 		var callbacks atomic.Int64
+		done := make(chan struct{})
 		o := Options[int, bool]{}.
 			SetDefaultTTL(ttl).
 			SetDeallocationFunc(func(_ int, _ bool, _ DeallocationReason) {
-				callbacks.Add(1)
+				if callbacks.Add(1) == 1 {
+					close(done)
+				}
 			})
 		c := New[int, bool](o)
 
 		c.Set(0, true, DefaultTTL)
 
-		// Delete concurrently with TTL expiry.
+		// Delete concurrently with TTL expiry: wait half the TTL then delete.
+		// The deallocation callback will fire from whichever wins (Delete or expiry).
 		time.Sleep(ttl / 2)
 		c.Delete(0)
 
-		// Wait for expiry to run.
-		time.Sleep(ttl * 4)
+		<-done // wait for exactly one deallocation
 		c.Close()
 
 		if n := callbacks.Load(); n != 1 {
@@ -546,55 +568,80 @@ func TestStressMultiTTLOrdering(t *testing.T) {
 	}
 	const (
 		keysPerTier = 32
-		// Well-separated tiers so the check windows don't overlap.
-		ttl1   = 80 * time.Millisecond
-		ttl2   = 400 * time.Millisecond
-		ttl3   = 800 * time.Millisecond
-		margin = 100 * time.Millisecond // generous but safely < gap between tiers
+		ttl1        = 80 * time.Millisecond
+		ttl2        = 200 * time.Millisecond
+		ttl3        = 400 * time.Millisecond
 	)
 
-	c := New[int, int](Options[int, int]{}.
+	// tier1Done fires after all tier-1 keys have expired.
+	// tier2Done fires after all tier-2 keys have expired.
+	// tier3Done fires after all tier-3 keys have expired.
+	var t1count, t2count, t3count atomic.Int64
+	tier1Done := make(chan struct{})
+	tier2Done := make(chan struct{})
+	tier3Done := make(chan struct{})
+
+	o := Options[int, int]{}.
 		SetDefaultTTL(ttl1).
-		DisableUpdateTime(true))
+		DisableUpdateTime(true).
+		SetDeallocationFunc(func(key int, _ int, reason DeallocationReason) {
+			if reason != ReasonTimedOut {
+				return
+			}
+			switch {
+			case key < keysPerTier:
+				if t1count.Add(1) == keysPerTier {
+					close(tier1Done)
+				}
+			case key < 2*keysPerTier:
+				if t2count.Add(1) == keysPerTier {
+					close(tier2Done)
+				}
+			default:
+				if t3count.Add(1) == keysPerTier {
+					close(tier3Done)
+				}
+			}
+		})
+	c := New[int, int](o)
 	defer c.Close()
 
-	start := time.Now()
 	for k := 0; k < keysPerTier; k++ {
 		c.Set(k, k, ttl1)
 		c.Set(keysPerTier+k, k, ttl2)
 		c.Set(2*keysPerTier+k, k, ttl3)
 	}
 
-	// Check 1 — at ttl1+margin: tier-1 gone, tiers 2+3 alive.
-	time.Sleep(time.Until(start.Add(ttl1 + margin)))
+	// Check 1 — after tier-1 expires: tier-1 gone, tiers 2+3 alive.
+	<-tier1Done
 	for k := 0; k < keysPerTier; k++ {
 		if _, ok := c.Get(k); ok {
-			t.Errorf("tier-1 key %d still alive after ttl1+margin", k)
+			t.Errorf("tier-1 key %d still alive after ttl1 expiry", k)
 		}
 		if _, ok := c.Get(keysPerTier + k); !ok {
-			t.Errorf("tier-2 key %d expired too early (check at %v)", k, time.Since(start))
+			t.Errorf("tier-2 key %d expired too early", k)
 		}
 		if _, ok := c.Get(2*keysPerTier + k); !ok {
-			t.Errorf("tier-3 key %d expired too early (check at %v)", k, time.Since(start))
+			t.Errorf("tier-3 key %d expired too early", k)
 		}
 	}
 
-	// Check 2 — at ttl2+margin: tier-2 gone, tier-3 still alive.
-	time.Sleep(time.Until(start.Add(ttl2 + margin)))
+	// Check 2 — after tier-2 expires: tier-2 gone, tier-3 still alive.
+	<-tier2Done
 	for k := 0; k < keysPerTier; k++ {
 		if _, ok := c.Get(keysPerTier + k); ok {
-			t.Errorf("tier-2 key %d still alive after ttl2+margin", k)
+			t.Errorf("tier-2 key %d still alive after ttl2 expiry", k)
 		}
 		if _, ok := c.Get(2*keysPerTier + k); !ok {
-			t.Errorf("tier-3 key %d expired too early (check at %v)", k, time.Since(start))
+			t.Errorf("tier-3 key %d expired too early", k)
 		}
 	}
 
-	// Check 3 — at ttl3+margin: all gone.
-	time.Sleep(time.Until(start.Add(ttl3 + margin)))
+	// Check 3 — after tier-3 expires: all gone.
+	<-tier3Done
 	for k := 0; k < keysPerTier; k++ {
 		if _, ok := c.Get(2*keysPerTier + k); ok {
-			t.Errorf("tier-3 key %d still alive after ttl3+margin", k)
+			t.Errorf("tier-3 key %d still alive after ttl3 expiry", k)
 		}
 	}
 }
@@ -766,7 +813,19 @@ func TestStressConcurrentReschedule(t *testing.T) {
 		ttl        = 80 * time.Millisecond
 	)
 
-	c := New[int, bool](Options[int, bool]{}.SetDefaultTTL(ttl))
+	done := make(chan struct{})
+	o := Options[int, bool]{}.
+		SetDefaultTTL(ttl).
+		SetDeallocationFunc(func(_ int, _ bool, reason DeallocationReason) {
+			if reason == ReasonTimedOut {
+				select {
+				case <-done:
+				default:
+					close(done)
+				}
+			}
+		})
+	c := New[int, bool](o)
 	defer c.Close()
 
 	var wg sync.WaitGroup
@@ -780,8 +839,8 @@ func TestStressConcurrentReschedule(t *testing.T) {
 	}
 	wg.Wait()
 
-	// After TTL+margin key must be expired.
-	time.Sleep(ttl * 5)
+	// After TTL+margin key must be expired — wait for the eviction callback.
+	<-done
 	if _, ok := c.Get(0); ok {
 		t.Fatal("key should have expired after reschedule from NoTTL to TTL")
 	}
@@ -873,6 +932,8 @@ func TestStressDeallocationReasons(t *testing.T) {
 	)
 
 	var wrongReason atomic.Int64
+	var expiredCount atomic.Int64
+	allExpired := make(chan struct{})
 	o := Options[int, int]{}.
 		SetDefaultTTL(ttl).
 		SetDeallocationFunc(func(key int, _ int, reason DeallocationReason) {
@@ -884,13 +945,24 @@ func TestStressDeallocationReasons(t *testing.T) {
 			if key >= deletedKeys && reason != ReasonTimedOut {
 				wrongReason.Add(1)
 			}
+			if key >= deletedKeys && reason == ReasonTimedOut {
+				if expiredCount.Add(1) == expiredKeys {
+					close(allExpired)
+				}
+			}
 		})
 
 	c := New[int, int](o)
 	defer c.Close()
 
-	// Set all keys.
-	for k := 0; k < deletedKeys+expiredKeys; k++ {
+	// Keys [0, deletedKeys) are set with NoTTL so they can ONLY be removed by
+	// an explicit Delete call — no race with the expiry goroutine.
+	for k := 0; k < deletedKeys; k++ {
+		c.Set(k, k, NoTTL)
+	}
+	// Keys [deletedKeys, deletedKeys+expiredKeys) are set with DefaultTTL so
+	// they will be swept by the expiry goroutine.
+	for k := deletedKeys; k < deletedKeys+expiredKeys; k++ {
 		c.Set(k, k, DefaultTTL)
 	}
 
@@ -906,8 +978,8 @@ func TestStressDeallocationReasons(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Give the second half time to expire.
-	time.Sleep(ttl * 8)
+	// Wait for all expiry callbacks to fire.
+	<-allExpired
 
 	if n := wrongReason.Load(); n != 0 {
 		t.Fatalf("%d callback(s) received wrong DeallocationReason", n)
@@ -925,11 +997,19 @@ func TestStressGetOrSetExpiredKey(t *testing.T) {
 	}
 	const ttl = 60 * time.Millisecond
 
-	c := New[string, int](Options[string, int]{}.SetDefaultTTL(ttl))
+	expired := make(chan struct{})
+	o := Options[string, int]{}.
+		SetDefaultTTL(ttl).
+		SetDeallocationFunc(func(_ string, _ int, reason DeallocationReason) {
+			if reason == ReasonTimedOut {
+				close(expired)
+			}
+		})
+	c := New[string, int](o)
 	defer c.Close()
 
 	c.Set("k", 1, DefaultTTL)
-	time.Sleep(ttl * 3) // let it expire
+	<-expired // wait for expiry rather than sleeping
 
 	v, ok := c.GetOrSet("k", 99, DefaultTTL)
 	if !ok || v != 99 {

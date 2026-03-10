@@ -23,10 +23,9 @@ func (c *Cache[K, V]) startExpirations() {
 
 	for {
 		select {
-		case sw, ok := <-c.ch:
-			if !ok {
-				return
-			}
+		case <-c.done:
+			return
+		case sw := <-c.ch:
 			if sw.t.IsZero() {
 				continue // NoTTL item — nothing to schedule
 			}
@@ -62,16 +61,8 @@ func (c *Cache[K, V]) startExpirations() {
 				}
 				// Shard i has items due — sweep only this shard.
 				perShard[i] = c.expireShard(i, now)
-				// Sync the atomic min so notify() has up-to-date information.
-				var minNano int64
-				if !perShard[i].IsZero() {
-					minNano = perShard[i].UnixNano()
-				}
-				c.perShardMin[i].Store(minNano)
-				if !perShard[i].IsZero() {
-					if nextWake.IsZero() || nextWake.After(perShard[i]) {
-						nextWake = perShard[i]
-					}
+				if !perShard[i].IsZero() && (nextWake.IsZero() || nextWake.After(perShard[i])) {
+					nextWake = perShard[i]
 				}
 			}
 
@@ -100,9 +91,14 @@ func stopTimer(t *time.Timer) {
 // expireShard sweeps shard idx for items whose deadline <= now, deletes them,
 // and returns the earliest FUTURE deadline remaining in that shard (zero if
 // none).  Only the targeted shard is locked — all other shards remain
-// uncontested.
+// uncontested.  Deallocation callbacks are fired after the lock is released.
 func (c *Cache[K, V]) expireShard(idx int, now time.Time) time.Time {
+	type evicted struct {
+		key K
+		val V
+	}
 	var soon time.Time
+	var batch []evicted
 	cm := &c.shards[idx]
 	cm.Lock()
 	for k, v := range cm.m {
@@ -115,8 +111,15 @@ func (c *Cache[K, V]) expireShard(idx int, now time.Time) time.Time {
 			}
 			continue
 		}
-		c.deleteUnsafe(cm, k, v, ReasonTimedOut)
+		c.deleteUnsafe(cm, k)
+		if c.o.deallocationFunc != nil {
+			batch = append(batch, evicted{k, v.v})
+		}
 	}
 	cm.Unlock()
+	// Fire callbacks outside the lock.
+	for _, e := range batch {
+		c.o.deallocationFunc(e.key, e.val, ReasonTimedOut)
+	}
 	return soon
 }

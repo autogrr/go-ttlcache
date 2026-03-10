@@ -5,7 +5,6 @@ package ttlcache
 
 import (
 	"hash/maphash"
-	"sync/atomic"
 	"time"
 
 	"github.com/autogrr/go-ttlcache/pkg/timecache"
@@ -26,11 +25,11 @@ func New[K comparable, V any](options Options[K, V]) *Cache[K, V] {
 	}
 
 	c := Cache[K, V]{
-		shards:      shards,
-		perShardMin: make([]atomic.Int64, n),
-		seed:        maphash.MakeSeed(),
-		o:           options,
-		ch:          make(chan shardWakeup, max(1024, n*64)),
+		shards: shards,
+		seed:   maphash.MakeSeed(),
+		o:      options,
+		ch:     make(chan shardWakeup, max(1024, n*64)),
+		done:   make(chan struct{}),
 	}
 
 	switch {
@@ -136,7 +135,7 @@ func (c *Cache[K, V]) GetKeys() []K {
 // call Close more than once; only the first call has any effect.
 func (c *Cache[K, V]) Close() {
 	if c.closed.CompareAndSwap(false, true) {
-		close(c.ch)
+		close(c.done)
 	}
 }
 
@@ -179,8 +178,8 @@ func (o Options[K, V]) SetShards(n int) Options[K, V] {
 
 // fixupDuration maps the DefaultTTL sentinel to NoTTL when no default is set.
 func (c *Cache[K, V]) fixupDuration(duration time.Duration) time.Duration {
-	if c.o.defaultTTL == NoTTL && duration == DefaultTTL {
-		return NoTTL
+	if duration == DefaultTTL {
+		return c.o.defaultTTL
 	}
 	return duration
 }
