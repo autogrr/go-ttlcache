@@ -48,6 +48,7 @@ func (c *Cache[K, V]) notify(cm *cacheMap[K, V], t time.Time) {
 
 	select {
 	case c.ch <- shardWakeup{idx: cm.idx, t: t}:
+	case <-c.done:
 	}
 }
 
